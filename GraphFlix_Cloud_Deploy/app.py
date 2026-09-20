@@ -363,14 +363,11 @@ def enrich(movie):
 
 
 # ==========================================================
-# Accounts / preferences / browsing history
+# Accounts / preferences / browsing history — Supabase
 # ==========================================================
-import sqlite3
 import hashlib
 import hmac
 import secrets
-
-DB_PATH = BASE_DIR / "graphflix_users.db"
 
 AVAILABLE_GENRES = ["動作", "科幻", "冒險", "動畫", "喜劇", "驚悚", "劇情", "愛情"]
 TMDB_GENRE_IDS = {
@@ -378,35 +375,53 @@ TMDB_GENRE_IDS = {
     "喜劇": 35, "驚悚": 53, "劇情": 18, "愛情": 10749,
 }
 
-def db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("""CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        salt TEXT NOT NULL,
-        password_hash TEXT NOT NULL,
-        fav_genres TEXT DEFAULT ''
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS viewed(
-        username TEXT NOT NULL,
-        tmdb_id INTEGER NOT NULL,
-        title TEXT,
-        viewed_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(username, tmdb_id)
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS favorites(
-        username TEXT NOT NULL,
-        tmdb_id INTEGER NOT NULL,
-        title TEXT,
-        added_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(username, tmdb_id)
-    )""")
-    conn.commit()
-    return conn
+def get_secret(name):
+    try:
+        value = st.secrets.get(name, "")
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return os.getenv(name, "").strip()
+
+SUPABASE_URL = get_secret("SUPABASE_URL").rstrip("/")
+SUPABASE_KEY = get_secret("SUPABASE_KEY")
+
+def supabase_ready():
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+def sb_request(method, table, params=None, payload=None, prefer=None):
+    if not supabase_ready():
+        raise RuntimeError("Supabase 尚未設定")
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    r = requests.request(
+        method,
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=headers,
+        params=params,
+        json=payload,
+        timeout=15,
+    )
+    if not r.ok:
+        raise RuntimeError(f"Supabase {r.status_code}: {r.text[:300]}")
+    if not r.text.strip():
+        return []
+    try:
+        return r.json()
+    except ValueError:
+        return []
 
 def password_hash(password, salt=None):
     salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 150_000)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), bytes.fromhex(salt), 150_000
+    )
     return salt, digest.hex()
 
 def register_user(username, password, fav_genres):
@@ -415,70 +430,75 @@ def register_user(username, password, fav_genres):
         return False, "帳號至少需要 3 個字元。"
     if len(password) < 4:
         return False, "密碼至少需要 4 個字元。"
-    salt, digest = password_hash(password)
     try:
-        conn = db()
-        conn.execute(
-            "INSERT INTO users(username,salt,password_hash,fav_genres) VALUES(?,?,?,?)",
-            (username, salt, digest, ",".join(fav_genres)),
-        )
-        conn.commit()
-        conn.close()
+        rows = sb_request("GET", "users", params={
+            "select": "id", "username": f"eq.{username}", "limit": "1"
+        })
+        if rows:
+            return False, "這個帳號已經被註冊。"
+        salt, digest = password_hash(password)
+        sb_request("POST", "users", payload={
+            "username": username,
+            "salt": salt,
+            "password_hash": digest,
+            "fav_genres": ",".join(fav_genres),
+        }, prefer="return=minimal")
         return True, "註冊成功，現在可以登入。"
-    except sqlite3.IntegrityError:
-        return False, "這個帳號已經被註冊。"
+    except Exception as e:
+        return False, f"註冊失敗：{e}"
 
 def login_user(username, password):
-    conn = db()
-    row = conn.execute(
-        "SELECT salt,password_hash,fav_genres FROM users WHERE username=?",
-        (username.strip(),),
-    ).fetchone()
-    conn.close()
-    if not row:
+    username = username.strip()
+    try:
+        rows = sb_request("GET", "users", params={
+            "select": "salt,password_hash,fav_genres",
+            "username": f"eq.{username}",
+            "limit": "1",
+        })
+        if not rows:
+            return False, None
+        row = rows[0]
+        _, digest = password_hash(password, row["salt"])
+        if not hmac.compare_digest(digest, row["password_hash"]):
+            return False, None
+        genres = [x for x in (row.get("fav_genres") or "").split(",") if x]
+        return True, genres
+    except Exception:
         return False, None
-    _, digest = password_hash(password, row[0])
-    if not hmac.compare_digest(digest, row[1]):
-        return False, None
-    genres = [x for x in (row[2] or "").split(",") if x]
-    return True, genres
 
 def save_genres(username, genres):
-    conn = db()
-    conn.execute("UPDATE users SET fav_genres=? WHERE username=?", (",".join(genres), username))
-    conn.commit()
-    conn.close()
+    sb_request("PATCH", "users",
+        params={"username": f"eq.{username}"},
+        payload={"fav_genres": ",".join(genres)},
+        prefer="return=minimal")
 
 def add_history(username, tmdb_id, title):
     if not tmdb_id:
         return
-    conn = db()
-    conn.execute(
-        "INSERT OR IGNORE INTO viewed(username,tmdb_id,title) VALUES(?,?,?)",
-        (username, int(tmdb_id), title),
-    )
-    conn.commit()
-    conn.close()
+    sb_request("POST", "viewed",
+        params={"on_conflict": "username,tmdb_id"},
+        payload={"username": username, "tmdb_id": int(tmdb_id), "title": title},
+        prefer="resolution=ignore-duplicates,return=minimal")
 
 def add_favorite(username, tmdb_id, title):
     if not tmdb_id:
         return
-    conn = db()
-    conn.execute(
-        "INSERT OR IGNORE INTO favorites(username,tmdb_id,title) VALUES(?,?,?)",
-        (username, int(tmdb_id), title),
-    )
-    conn.commit()
-    conn.close()
+    sb_request("POST", "favorites",
+        params={"on_conflict": "username,tmdb_id"},
+        payload={"username": username, "tmdb_id": int(tmdb_id), "title": title},
+        prefer="resolution=ignore-duplicates,return=minimal")
 
 def get_user_list(table, username):
-    conn = db()
-    rows = conn.execute(
-        f"SELECT tmdb_id,title FROM {table} WHERE username=? ORDER BY rowid DESC",
-        (username,),
-    ).fetchall()
-    conn.close()
-    return rows
+    if table not in {"favorites", "viewed"}:
+        return []
+    order_col = "added_at.desc" if table == "favorites" else "viewed_at.desc"
+    rows = sb_request("GET", table, params={
+        "select": "tmdb_id,title",
+        "username": f"eq.{username}",
+        "order": order_col,
+        "limit": "30",
+    })
+    return [(row.get("tmdb_id"), row.get("title")) for row in rows]
 
 @st.cache_data(ttl=1800)
 def discover_by_genre(genre_name, page=1):
@@ -555,7 +575,6 @@ def stable_movielens_user(username, num_users):
 # UI
 # ==========================================================
 st.set_page_config(page_title="GraphFlix", page_icon="🎬", layout="wide")
-db()
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -568,6 +587,10 @@ if "batch" not in st.session_state:
 
 st.title("🎬 GraphFlix")
 st.caption("LightGCN + MovieLens + TMDb｜登入・分類・個人化推薦完整網頁版")
+if not supabase_ready():
+    st.error("Supabase 尚未連線。請確認 Streamlit Secrets 已設定 SUPABASE_URL 與 SUPABASE_KEY。")
+    st.stop()
+
 
 # ---------------- Authentication ----------------
 if not st.session_state.logged_in:
@@ -607,13 +630,14 @@ if not st.session_state.logged_in:
                 ok, msg = register_user(new_u, new_p, new_genres)
                 (st.success if ok else st.error)(msg)
 
-    st.caption("雲端展示版的帳號資料儲存在 Streamlit 執行環境；免費雲端重建環境時資料可能重置。")
+    st.caption("☁️ 帳號、喜好、收藏與觀看紀錄會儲存在 Supabase 雲端資料庫。")
     st.stop()
 
 username = st.session_state.username
 
 with st.sidebar:
     st.header(f"👤 {username}")
+    st.success("Supabase：已連線")
     st.write("偏好：" + ("、".join(st.session_state.fav_genres) if st.session_state.fav_genres else "尚未設定"))
     if TMDB_API_KEY:
         st.success("TMDb API：已設定")
