@@ -4,12 +4,13 @@ import re
 import zipfile
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import extra_streamlit_components as stx
 import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
@@ -500,6 +501,61 @@ def get_user_list(table, username):
     })
     return [(row.get("tmdb_id"), row.get("title")) for row in rows]
 
+REMEMBER_COOKIE = "graphflix_remember"
+REMEMBER_DAYS = 30
+
+def token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def create_remember_token(username):
+    raw_token = secrets.token_urlsafe(48)
+    expires = datetime.now(timezone.utc) + timedelta(days=REMEMBER_DAYS)
+    sb_request("POST", "login_tokens", payload={
+        "username": username,
+        "token_hash": token_hash(raw_token),
+        "expires_at": expires.isoformat(),
+    }, prefer="return=minimal")
+    return raw_token, expires
+
+def delete_remember_token(raw_token):
+    if not raw_token:
+        return
+    try:
+        sb_request("DELETE", "login_tokens",
+            params={"token_hash": f"eq.{token_hash(raw_token)}"},
+            prefer="return=minimal")
+    except Exception:
+        pass
+
+def load_user_by_token(raw_token):
+    if not raw_token:
+        return None
+    try:
+        rows = sb_request("GET", "login_tokens", params={
+            "select": "username,expires_at",
+            "token_hash": f"eq.{token_hash(raw_token)}",
+            "limit": "1",
+        })
+        if not rows:
+            return None
+        row = rows[0]
+        expires_at = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+        if expires_at <= datetime.now(timezone.utc):
+            delete_remember_token(raw_token)
+            return None
+        users = sb_request("GET", "users", params={
+            "select": "username,fav_genres",
+            "username": f"eq.{row['username']}",
+            "limit": "1",
+        })
+        if not users:
+            return None
+        user = users[0]
+        genres = [x for x in (user.get("fav_genres") or "").split(",") if x]
+        return user["username"], genres
+    except Exception:
+        return None
+
 @st.cache_data(ttl=1800)
 def discover_by_genre(genre_name, page=1):
     gid = TMDB_GENRE_IDS.get(genre_name)
@@ -585,6 +641,16 @@ if "fav_genres" not in st.session_state:
 if "batch" not in st.session_state:
     st.session_state.batch = 0
 
+cookie_manager = stx.CookieManager(key="graphflix_cookie_manager")
+if not st.session_state.logged_in:
+    remembered_token = cookie_manager.get(REMEMBER_COOKIE)
+    remembered_user = load_user_by_token(remembered_token)
+    if remembered_user:
+        remembered_username, remembered_genres = remembered_user
+        st.session_state.logged_in = True
+        st.session_state.username = remembered_username
+        st.session_state.fav_genres = remembered_genres
+
 st.title("🎬 GraphFlix")
 st.caption("LightGCN + MovieLens + TMDb｜登入・分類・個人化推薦完整網頁版")
 if not supabase_ready():
@@ -601,6 +667,7 @@ if not st.session_state.logged_in:
         with st.form("login_form"):
             u = st.text_input("帳號")
             p = st.text_input("密碼", type="password")
+            remember_me = st.checkbox("記住我（30 天）", value=True)
             submitted = st.form_submit_button("登入", use_container_width=True)
         if submitted:
             ok, genres = login_user(u, p)
@@ -608,6 +675,16 @@ if not st.session_state.logged_in:
                 st.session_state.logged_in = True
                 st.session_state.username = u.strip()
                 st.session_state.fav_genres = genres
+                if remember_me:
+                    try:
+                        raw_token, expires = create_remember_token(u.strip())
+                        cookie_manager.set(
+                            REMEMBER_COOKIE, raw_token,
+                            expires_at=expires,
+                            key="set_graphflix_remember",
+                        )
+                    except Exception as e:
+                        st.warning(f"登入成功，但無法建立永久登入：{e}")
                 st.rerun()
             else:
                 st.error("帳號或密碼錯誤。")
@@ -644,6 +721,12 @@ with st.sidebar:
     else:
         st.warning("TMDb API：未設定")
     if st.button("🚪 登出", use_container_width=True):
+        old_token = cookie_manager.get(REMEMBER_COOKIE)
+        delete_remember_token(old_token)
+        try:
+            cookie_manager.delete(REMEMBER_COOKIE, key="delete_graphflix_remember")
+        except Exception:
+            pass
         st.session_state.logged_in = False
         st.session_state.username = ""
         st.session_state.fav_genres = []
