@@ -1,33 +1,26 @@
-# GraphFlix Cloud
+# GraphFlix Full App
 
-這是可部署到 Streamlit Community Cloud 的 GraphFlix 版本。
+完整 Streamlit 網頁版，包含：
+- 註冊 / 登入 / 登出
+- 喜好類型設定
+- LightGCN 個人推薦
+- 換一批推薦
+- 8 大電影分類
+- TMDb 電影搜尋
+- 收藏與觀看紀錄
+- TMDb 海報、評分、上映日期、簡介
 
-## GitHub 要上傳的檔案
-- app.py
-- requirements.txt
-- runtime.txt
-- .gitignore
-- .env.example
-- README.md
+## Streamlit Cloud
+若沿用目前 GitHub 專案，將這個資料夾中的檔案上傳並覆蓋原本 `GraphFlix_Cloud_Deploy` 內的同名檔案即可。
 
-## Streamlit Cloud 設定
-1. 建立 GitHub repository，將本資料夾的檔案上傳。
-2. 在 Streamlit Community Cloud 建立 App。
-3. Repository 選剛建立的 repo。
-4. Main file path 填 `app.py`。
-5. Advanced settings / Secrets 加入：
+Main file path：
+`GraphFlix_Cloud_Deploy/app.py`
 
+Secrets：
 ```toml
 TMDB_API_KEY = "你的 TMDb API Key"
 ```
 
-6. Deploy。
-
-部署完成後會得到 `https://...streamlit.app` 公開網址。
-
-## 注意
-- 不要把真正的 TMDb API Key 寫進 app.py、.env.example 或 GitHub。
-- 本版會優先讀取 Streamlit Secrets，也支援本機的 `TMDB_API_KEY` 環境變數。
-- 為了讓免費雲端第一次訓練比較實際，預設 epochs 設為 30。
-- MovieLens 100K 會在第一次啟動時自動下載。
-- 免費雲端執行環境可能休眠或重建；若暫存模型消失，需再次按初始化/訓練。
+> 注意：免費 Streamlit Community Cloud 的本機檔案系統不是永久資料庫。
+> 本版帳號、收藏、觀看紀錄用 SQLite，適合專題展示；雲端環境重建時可能重置。
+> 若要正式多人長期使用，下一階段建議把使用者資料改接 Supabase / PostgreSQL。
